@@ -1,0 +1,1250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script>
+// ═══════════════════════════════════════════════
+//  INLINE PWA BOOTSTRAP
+//  Generates manifest + service worker from Blob URLs
+//  No external files needed — single HTML file PWA
+// ═══════════════════════════════════════════════
+
+(function() {
+  'use strict';
+
+  // ── 1. Inline Manifest via Blob URL ──
+  const MANIFEST_JSON = `{
+  "name": "HMS Attendance Scanner",
+  "short_name": "HMS Attend",
+  "description": "Hospital Management System — Employee Attendance Scanner",
+  "start_url": "./HMS_Attendance_Scanner.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "theme_color": "#0a1628",
+  "background_color": "#0a1628",
+  "categories": ["medical", "productivity", "utilities"],
+  "icons": [
+    {
+      "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'%3E%3Crect width='192' height='192' rx='40' fill='%230a1628'/%3E%3Crect x='85' y='32' width='22' height='128' rx='8' fill='%231565c0'/%3E%3Crect x='32' y='85' width='128' height='22' rx='8' fill='%231565c0'/%3E%3Ccircle cx='96' cy='96' r='24' fill='none' stroke='%2342a5f5' stroke-width='6'/%3E%3C/svg%3E",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect width='512' height='512' rx='96' fill='%230a1628'/%3E%3Crect x='224' y='80' width='64' height='352' rx='20' fill='%231565c0'/%3E%3Crect x='80' y='224' width='352' height='64' rx='20' fill='%231565c0'/%3E%3Ccircle cx='256' cy='256' r='72' fill='none' stroke='%2342a5f5' stroke-width='16'/%3E%3C/svg%3E",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Mark Attendance",
+      "short_name": "Scan",
+      "description": "Open QR scanner to mark attendance",
+      "url": "./HMS_Attendance_Scanner.html",
+      "icons": [{ "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 96 96'%3E%3Crect width='96' height='96' rx='20' fill='%230a1628'/%3E%3Cpath d='M20 20h24v24H20zM52 20h24v24H52zM20 52h24v24H20z' fill='none' stroke='%2342a5f5' stroke-width='4'/%3E%3Crect x='56' y='56' width='8' height='8' fill='%2342a5f5'/%3E%3Crect x='68' y='56' width='8' height='8' fill='%2342a5f5'/%3E%3Crect x='56' y='68' width='20' height='8' fill='%2342a5f5'/%3E%3C/svg%3E", "sizes": "96x96" }]
+    }
+  ],
+  "screenshots": [],
+  "prefer_related_applications": false
+}
+`;
+
+  function injectManifest() {
+    try {
+      const blob = new Blob([MANIFEST_JSON], {type: 'application/manifest+json'});
+      const url  = URL.createObjectURL(blob);
+      // Remove any existing manifest link
+      document.querySelectorAll('link[rel="manifest"]').forEach(l => l.remove());
+      const link = document.createElement('link');
+      link.rel   = 'manifest';
+      link.href  = url;
+      document.head.appendChild(link);
+    } catch(e) { console.warn('[PWA] Manifest inject failed:', e); }
+  }
+
+  // ── 2. Inline Service Worker via Blob URL ──
+  // SW fetches THIS html file for caching — adapt PRECACHE_URLS
+  const SW_CODE = `/* ═══════════════════════════════════════════════════
+   HMS Attendance Scanner — Service Worker
+   Cache-first strategy for offline capability
+   ═══════════════════════════════════════════════════ */
+
+const CACHE_NAME    = 'hms-att-v1.2';
+const RUNTIME_CACHE = 'hms-att-runtime-v1';
+
+// Files to pre-cache on install
+const PRECACHE_URLS = [
+  './HMS_Attendance_Scanner.html',
+  './manifest.json',
+  'https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&display=swap',
+  'https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js',
+];
+
+// ── Install: pre-cache shell ──
+self.addEventListener('install', event => {
+  event.waitUntil(
+    caches.open(CACHE_NAME)
+      .then(cache => {
+        // Cache what we can — ignore failures for CDN resources
+        return Promise.allSettled(
+          PRECACHE_URLS.map(url =>
+            cache.add(url).catch(() => console.warn('[SW] Could not cache:', url))
+          )
+        );
+      })
+      .then(() => self.skipWaiting())
+  );
+});
+
+// ── Activate: clean old caches ──
+self.addEventListener('activate', event => {
+  event.waitUntil(
+    caches.keys().then(keys =>
+      Promise.all(
+        keys
+          .filter(k => k !== CACHE_NAME && k !== RUNTIME_CACHE)
+          .map(k => caches.delete(k))
+      )
+    ).then(() => self.clients.claim())
+  );
+});
+
+// ── Fetch: stale-while-revalidate for app shell ──
+self.addEventListener('fetch', event => {
+  const url = new URL(event.request.url);
+
+  // Don't intercept non-GET or browser-extension requests
+  if (event.request.method !== 'GET') return;
+  if (url.protocol === 'chrome-extension:') return;
+
+  // Camera / media requests — always go to network
+  if (url.pathname.includes('camera') || event.request.headers.get('Accept')?.includes('video')) return;
+
+  // Fonts — cache-first, long TTL
+  if (url.hostname === 'fonts.googleapis.com' || url.hostname === 'fonts.gstatic.com') {
+    event.respondWith(cacheFirst(event.request, CACHE_NAME));
+    return;
+  }
+
+  // CDN scripts (html5-qrcode, qrcodejs) — cache-first
+  if (url.hostname.includes('unpkg.com') || url.hostname.includes('cdnjs.cloudflare.com')) {
+    event.respondWith(cacheFirst(event.request, RUNTIME_CACHE));
+    return;
+  }
+
+  // App HTML — stale-while-revalidate
+  if (url.pathname.endsWith('.html') || url.pathname.endsWith('/')) {
+    event.respondWith(staleWhileRevalidate(event.request, CACHE_NAME));
+    return;
+  }
+
+  // Manifest, icons
+  if (url.pathname.endsWith('.json') || url.pathname.endsWith('.png') || url.pathname.endsWith('.svg')) {
+    event.respondWith(cacheFirst(event.request, CACHE_NAME));
+    return;
+  }
+
+  // Everything else — network with cache fallback
+  event.respondWith(networkFirst(event.request, RUNTIME_CACHE));
+});
+
+// ── Cache strategies ──
+async function cacheFirst(request, cacheName) {
+  const cached = await caches.match(request);
+  if (cached) return cached;
+  try {
+    const response = await fetch(request);
+    if (response.ok) {
+      const cache = await caches.open(cacheName);
+      cache.put(request, response.clone());
+    }
+    return response;
+  } catch {
+    return new Response('Offline — resource unavailable', { status: 503 });
+  }
+}
+
+async function networkFirst(request, cacheName) {
+  try {
+    const response = await fetch(request);
+    if (response.ok) {
+      const cache = await caches.open(cacheName);
+      cache.put(request, response.clone());
+    }
+    return response;
+  } catch {
+    const cached = await caches.match(request);
+    return cached || new Response('Offline', { status: 503 });
+  }
+}
+
+async function staleWhileRevalidate(request, cacheName) {
+  const cache  = await caches.open(cacheName);
+  const cached = await cache.match(request);
+  const fetchPromise = fetch(request).then(response => {
+    if (response.ok) cache.put(request, response.clone());
+    return response;
+  }).catch(() => null);
+  return cached || await fetchPromise;
+}
+
+// ── Push message from page ──
+self.addEventListener('message', event => {
+  if (event.data?.type === 'SKIP_WAITING') self.skipWaiting();
+});
+`;
+
+  function registerSW() {
+    if (!('serviceWorker' in navigator)) {
+      console.warn('[PWA] Service Worker not supported');
+      return;
+    }
+    try {
+      const blob = new Blob([SW_CODE], {type: 'application/javascript'});
+      const swURL = URL.createObjectURL(blob);
+
+      navigator.serviceWorker.register(swURL, {scope: './'}  )
+        .then(reg => {
+          console.log('[PWA] SW registered (blob)');
+          reg.addEventListener('updatefound', () => {
+            const nw = reg.installing;
+            nw?.addEventListener('statechange', () => {
+              if (nw.state === 'installed' && navigator.serviceWorker.controller) {
+                nw.postMessage({type: 'SKIP_WAITING'});
+              }
+            });
+          });
+        })
+        .catch(err => {
+          // Blob SW may be blocked in some browsers — silently skip
+          console.warn('[PWA] SW registration skipped:', err.message);
+        });
+    } catch(e) { console.warn('[PWA] SW blob error:', e); }
+  }
+
+  // ── 3. Run on DOM ready ──
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => {
+      injectManifest();
+      registerSW();
+    });
+  } else {
+    injectManifest();
+    registerSW();
+  }
+})();
+</script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0a1628">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="HMS Attend">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="description" content="HMS Employee Attendance Scanner — Scan QR to mark attendance">
+<title>HMS Attendance</title>
+
+<!-- PWA Manifest -->
+
+<!-- Apple Touch Icons (inline SVG data URI) -->
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'%3E%3Crect width='180' height='180' rx='38' fill='%230a1628'/%3E%3Crect x='79' y='30' width='22' height='120' rx='8' fill='%231565c0'/%3E%3Crect x='30' y='79' width='120' height='22' rx='8' fill='%231565c0'/%3E%3Ccircle cx='90' cy='90' r='22' fill='none' stroke='%2342a5f5' stroke-width='6'/%3E%3C/svg%3E">
+
+<!-- Fonts -->
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&display=swap" rel="stylesheet">
+
+<!-- QR Scanner Library -->
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+
+<style>
+/* ════════════════════════ BASE ════════════════════════ */
+*, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+
+:root {
+  --dark:   #0a1628;
+  --dark2:  #0d1f38;
+  --accent: #1565c0;
+  --blue2:  #1976d2;
+  --light:  #42a5f5;
+  --green:  #4caf50;
+  --red:    #ef5350;
+  --yellow: #ffa726;
+  --text:   #ffffff;
+  --muted:  rgba(255,255,255,.45);
+  --sub:    rgba(255,255,255,.25);
+  --border: rgba(255,255,255,.12);
+  --card:   rgba(255,255,255,.06);
+}
+
+html, body {
+  height: 100%; width: 100%;
+  background: var(--dark);
+  color: var(--text);
+  font-family: 'Nunito', sans-serif;
+  overflow: hidden;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* ════════════════════════ SPLASH SCREEN ════════════════════════ */
+#splash {
+  position: fixed; inset: 0; z-index: 9999;
+  background: linear-gradient(160deg, #0a1628 0%, #0d2448 60%, #0a1628 100%);
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  gap: 0;
+  transition: opacity .6s ease, transform .6s ease;
+}
+#splash.hide {
+  opacity: 0; transform: scale(1.05); pointer-events: none;
+}
+.splash-logo {
+  width: 90px; height: 90px;
+  background: linear-gradient(135deg, var(--accent), var(--light));
+  border-radius: 24px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 44px;
+  box-shadow: 0 0 60px rgba(21,101,192,.5);
+  animation: splashPulse 2s ease-in-out infinite;
+  margin-bottom: 24px;
+}
+@keyframes splashPulse {
+  0%,100% { box-shadow: 0 0 40px rgba(21,101,192,.4); }
+  50%      { box-shadow: 0 0 80px rgba(66,165,245,.7); }
+}
+.splash-name {
+  font-size: 26px; font-weight: 900;
+  color: var(--text); letter-spacing: .04em; margin-bottom: 6px;
+}
+.splash-sub {
+  font-size: 13px; color: var(--muted);
+  font-weight: 600; margin-bottom: 48px;
+}
+.splash-bar-wrap {
+  width: 160px; height: 4px;
+  background: rgba(255,255,255,.1); border-radius: 2px; overflow: hidden;
+}
+.splash-bar {
+  height: 100%; border-radius: 2px;
+  background: linear-gradient(90deg, var(--accent), var(--light));
+  animation: splashLoad 1.8s ease-in-out forwards;
+}
+@keyframes splashLoad {
+  0%  { width: 0%; }
+  40% { width: 60%; }
+  80% { width: 85%; }
+  100%{ width: 100%; }
+}
+.splash-version {
+  position: absolute; bottom: 32px;
+  font-size: 11px; color: var(--sub); font-weight: 600;
+}
+
+/* ════════════════════════ INSTALL PROMPT ════════════════════════ */
+#install-prompt {
+  position: fixed; inset: 0; z-index: 8000;
+  background: rgba(10,22,40,.88);
+  backdrop-filter: blur(12px);
+  display: none; align-items: flex-end; justify-content: center;
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+#install-prompt.show { display: flex; }
+.install-card {
+  background: linear-gradient(160deg, #0d2448, #0a1628);
+  border: 1.5px solid rgba(66,165,245,.25);
+  border-radius: 24px 24px 0 0;
+  padding: 28px 24px 32px;
+  width: 100%; max-width: 480px;
+  box-shadow: 0 -20px 60px rgba(0,0,0,.5);
+  animation: slideUp .4s cubic-bezier(.34,1.56,.64,1);
+}
+@keyframes slideUp {
+  from { transform: translateY(100%); opacity: 0; }
+  to   { transform: translateY(0);    opacity: 1; }
+}
+.install-card .ic-icon {
+  width: 60px; height: 60px;
+  background: linear-gradient(135deg,var(--accent),var(--light));
+  border-radius: 16px; display: flex; align-items: center;
+  justify-content: center; font-size: 28px; margin: 0 auto 16px;
+}
+.install-card h2 {
+  font-size: 19px; font-weight: 900; text-align: center; margin-bottom: 8px;
+}
+.install-card p {
+  font-size: 13px; color: var(--muted); text-align: center; line-height: 1.6; margin-bottom: 24px;
+}
+.install-card .ic-features {
+  display: flex; gap: 12px; margin-bottom: 24px; flex-wrap: wrap; justify-content: center;
+}
+.ic-feat {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 20px; padding: 6px 14px;
+  font-size: 11px; font-weight: 700; color: var(--light);
+  display: flex; align-items: center; gap: 5px;
+}
+.install-btn {
+  width: 100%; padding: 15px;
+  border-radius: 14px; border: none; cursor: pointer;
+  font-family: 'Nunito', sans-serif; font-size: 15px; font-weight: 900;
+  background: linear-gradient(135deg, var(--accent), var(--light));
+  color: #fff;
+  box-shadow: 0 6px 24px rgba(21,101,192,.5);
+  margin-bottom: 10px; letter-spacing: .03em;
+  transition: all .2s;
+}
+.install-btn:hover { transform: translateY(-1px); box-shadow: 0 10px 32px rgba(21,101,192,.65); }
+.install-skip {
+  width: 100%; padding: 10px; border: none; cursor: pointer;
+  background: transparent; color: var(--muted);
+  font-family: 'Nunito', sans-serif; font-size: 13px; font-weight: 700;
+}
+
+/* ════════════════════════ APP SHELL ════════════════════════ */
+#app {
+  display: flex; flex-direction: column;
+  height: 100dvh; max-height: 100dvh;
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* Top bar */
+.topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 18px 10px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.topbar-left { display: flex; align-items: center; gap: 10px; }
+.topbar-logo {
+  width: 34px; height: 34px;
+  background: linear-gradient(135deg, var(--accent), var(--light));
+  border-radius: 9px; display: flex; align-items: center;
+  justify-content: center; font-size: 16px;
+}
+.topbar-title { font-size: 15px; font-weight: 900; letter-spacing: .02em; }
+.topbar-sub   { font-size: 10px; color: var(--muted); font-weight: 600; }
+.network-pill {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 10px; font-weight: 700;
+  padding: 4px 10px; border-radius: 20px;
+  border: 1px solid; transition: all .4s;
+}
+.network-pill.online  { background:rgba(76,175,80,.15); border-color:rgba(76,175,80,.35); color:#81c784; }
+.network-pill.offline { background:rgba(239,83,80,.15); border-color:rgba(239,83,80,.35); color:#ef9a9a; }
+.net-dot { width:7px;height:7px;border-radius:50%; animation:netPulse 2s infinite; }
+.online  .net-dot { background:#4caf50; }
+.offline .net-dot { background:#ef5350; }
+@keyframes netPulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.5;transform:scale(1.4)} }
+
+/* ── SCREENS ── */
+.screen { flex:1; overflow-y:auto; display:none; flex-direction:column; }
+.screen.active { display:flex; }
+
+/* ════════════════════════ LOGIN SCREEN ════════════════════════ */
+#screen-login {
+  align-items: center; justify-content: center;
+  padding: 24px 24px 40px; gap: 0;
+}
+.login-avatar { font-size: 60px; margin-bottom: 16px; }
+.login-title  { font-size: 22px; font-weight: 900; margin-bottom: 6px; }
+.login-sub    { font-size: 13px; color: var(--muted); margin-bottom: 32px; text-align: center; }
+
+.login-form { width: 100%; max-width: 340px; display: flex; flex-direction: column; gap: 12px; }
+.att-input {
+  width: 100%; padding: 15px 18px;
+  background: var(--card);
+  border: 1.5px solid var(--border);
+  border-radius: 14px; color: var(--text);
+  font-family: 'Nunito', sans-serif;
+  font-size: 16px; font-weight: 700;
+  outline: none; text-align: center;
+  text-transform: uppercase; letter-spacing: .1em;
+  transition: border .2s;
+  -webkit-appearance: none;
+}
+.att-input:focus { border-color: var(--light); background: rgba(66,165,245,.08); }
+.att-input::placeholder { color: var(--sub); font-weight: 600; text-transform: none; letter-spacing: 0; }
+.login-btn {
+  width: 100%; padding: 15px;
+  border-radius: 14px; border: none; cursor: pointer;
+  font-family: 'Nunito', sans-serif; font-size: 16px; font-weight: 900;
+  background: linear-gradient(135deg, var(--accent), var(--light));
+  color: #fff; box-shadow: 0 6px 24px rgba(21,101,192,.45);
+  transition: all .2s;
+}
+.login-btn:active { transform: scale(.97); }
+.login-err { font-size: 12px; color: #ef9a9a; font-weight: 700; min-height: 16px; text-align: center; }
+
+/* ════════════════════════ MAIN SCREEN ════════════════════════ */
+#screen-main {
+  padding: 0; overflow: hidden;
+}
+
+/* Employee info strip */
+.emp-strip {
+  background: linear-gradient(135deg, var(--dark2), #132040);
+  border-bottom: 1px solid var(--border);
+  padding: 14px 18px;
+  display: flex; align-items: center; gap: 14px;
+  flex-shrink: 0;
+}
+.emp-avatar {
+  width: 48px; height: 48px; border-radius: 50%;
+  border: 2px solid rgba(66,165,245,.4);
+  background: linear-gradient(135deg, var(--accent), var(--light));
+  display: flex; align-items: center; justify-content: center;
+  font-size: 20px; font-weight: 900; color: #fff;
+  overflow: hidden; flex-shrink: 0;
+}
+.emp-avatar img { width:100%; height:100%; object-fit:cover; }
+.emp-name  { font-size: 15px; font-weight: 900; }
+.emp-desig { font-size: 11px; color: var(--muted); font-weight: 600; }
+.emp-id    { font-family: monospace; font-size: 11px; color: var(--light); font-weight: 700; margin-top: 2px; }
+
+/* Type selector */
+.type-row {
+  display: flex; gap: 8px; padding: 14px 18px 10px;
+  flex-shrink: 0;
+}
+.type-btn {
+  flex: 1; padding: 10px 4px;
+  border-radius: 12px;
+  border: 2px solid var(--border);
+  background: var(--card); color: var(--muted);
+  font-family: 'Nunito', sans-serif; font-size: 12px; font-weight: 700;
+  cursor: pointer; display: flex; flex-direction: column;
+  align-items: center; gap: 4px; transition: all .2s;
+}
+.type-btn .ticon { font-size: 20px; line-height: 1; }
+.type-btn.sel-in    { border-color: var(--green); background:rgba(76,175,80,.15); color:#81c784; }
+.type-btn.sel-out   { border-color: var(--red);   background:rgba(239,83,80,.15); color:#ef9a9a; }
+.type-btn.sel-break { border-color: var(--yellow); background:rgba(255,167,38,.15); color:#ffcc80; }
+
+/* Token status bar */
+.token-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 18px; flex-shrink: 0;
+  background: rgba(0,0,0,.2);
+}
+.token-pill {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 11px; font-weight: 700;
+  padding: 4px 10px; border-radius: 20px;
+}
+.token-valid   { background:rgba(76,175,80,.15);border:1px solid rgba(76,175,80,.3);color:#81c784; }
+.token-invalid { background:rgba(239,83,80,.15);border:1px solid rgba(239,83,80,.3);color:#ef9a9a; }
+.token-wait    { background:rgba(255,167,38,.15);border:1px solid rgba(255,167,38,.3);color:#ffcc80; }
+
+/* Scanner area */
+.scanner-wrap {
+  flex: 1; position: relative;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  padding: 12px 18px; min-height: 0;
+  overflow: hidden;
+}
+#qr-reader {
+  width: 100%; max-width: 360px;
+  border-radius: 18px; overflow: hidden;
+  border: 2px solid rgba(66,165,245,.3);
+  box-shadow: 0 0 40px rgba(21,101,192,.2);
+}
+/* Override html5-qrcode internal */
+#qr-reader video              { border-radius: 16px !important; }
+#qr-reader__scan_region       { background: transparent !important; }
+#qr-reader__header_message    { display: none !important; }
+#qr-reader__status_span       { color:rgba(255,255,255,.6)!important; font-size:12px!important; font-family:Nunito,sans-serif!important; }
+#qr-reader__dashboard_section_csr button {
+  background: rgba(255,255,255,.1)!important; color:#fff!important;
+  border:1px solid rgba(255,255,255,.2)!important; border-radius:8px!important;
+  font-family:Nunito,sans-serif!important; font-weight:700!important; padding:8px 16px!important;
+  cursor:pointer!important;
+}
+#qr-reader__camera_selection {
+  background:transparent!important; color:rgba(255,255,255,.7)!important;
+  border:1px solid var(--border)!important; border-radius:8px!important;
+  font-family:Nunito,sans-serif!important; padding:6px 10px!important;
+  font-size:12px!important;
+}
+
+.scan-hint {
+  margin-top: 12px; font-size: 12px; color: var(--muted); font-weight: 600; text-align: center;
+}
+.scan-start-btn {
+  width: 100%; max-width: 340px; margin-top: 16px;
+  padding: 16px; border-radius: 16px; border: none; cursor: pointer;
+  font-family: 'Nunito', sans-serif; font-size: 16px; font-weight: 900;
+  background: linear-gradient(135deg, var(--accent), var(--light));
+  color: #fff; box-shadow: 0 8px 28px rgba(21,101,192,.45);
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  transition: all .25s;
+}
+.scan-start-btn:active { transform: scale(.97); }
+.scan-start-btn:disabled {
+  background: rgba(255,255,255,.08); color: var(--muted); box-shadow: none; cursor: not-allowed;
+}
+.stop-scan-btn {
+  width: 100%; max-width: 340px; margin-top: 10px;
+  padding: 11px; border-radius: 12px;
+  border: 1.5px solid var(--border); background: transparent;
+  color: var(--muted); font-family: 'Nunito', sans-serif;
+  font-size: 13px; font-weight: 700; cursor: pointer;
+  transition: all .2s;
+}
+.stop-scan-btn:hover { border-color: var(--red); color: #ef9a9a; }
+
+/* Bottom logout */
+.bottom-bar {
+  padding: 10px 18px 14px;
+  border-top: 1px solid var(--border);
+  display: flex; justify-content: space-between; align-items: center;
+  flex-shrink: 0;
+}
+.logout-btn {
+  background: transparent; border: 1px solid var(--border);
+  color: var(--muted); border-radius: 8px; padding: 6px 14px;
+  font-family: 'Nunito', sans-serif; font-size: 12px; font-weight: 700; cursor: pointer;
+  transition: all .2s;
+}
+.logout-btn:hover { border-color: var(--red); color: #ef9a9a; }
+.today-badge {
+  font-size: 12px; color: var(--muted); font-weight: 600;
+}
+.today-badge b { color: var(--light); }
+
+/* ════════════════════════ SUCCESS OVERLAY ════════════════════════ */
+#success-overlay {
+  position: fixed; inset: 0; z-index: 7000;
+  background: rgba(10,22,40,.92);
+  backdrop-filter: blur(16px);
+  display: none; flex-direction: column;
+  align-items: center; justify-content: center; gap: 0;
+  transition: opacity .3s;
+}
+#success-overlay.show { display: flex; }
+.success-icon {
+  font-size: 80px; margin-bottom: 16px;
+  animation: successPop .5s cubic-bezier(.34,1.56,.64,1);
+}
+@keyframes successPop {
+  from { transform: scale(0); opacity: 0; }
+  to   { transform: scale(1); opacity: 1; }
+}
+.success-title {
+  font-size: 28px; font-weight: 900;
+  color: #81c784; margin-bottom: 8px;
+  animation: successPop .5s .1s cubic-bezier(.34,1.56,.64,1) both;
+}
+.success-name {
+  font-size: 18px; font-weight: 700; color: var(--text); margin-bottom: 6px;
+  animation: successPop .5s .15s cubic-bezier(.34,1.56,.64,1) both;
+}
+.success-time {
+  font-size: 14px; color: var(--muted); font-weight: 600;
+  animation: successPop .5s .2s cubic-bezier(.34,1.56,.64,1) both;
+}
+.success-bar-wrap {
+  width: 180px; height: 4px; margin-top: 32px;
+  background: rgba(255,255,255,.1); border-radius: 2px; overflow: hidden;
+}
+.success-bar {
+  height: 100%; background: var(--green); border-radius: 2px;
+  transition: width 4s linear;
+  width: 0%;
+}
+
+/* ════════════════════════ ERROR TOAST ════════════════════════ */
+#toast {
+  position: fixed; left: 50%; bottom: 80px;
+  transform: translateX(-50%) translateY(20px);
+  opacity: 0; transition: all .35s;
+  z-index: 6000; pointer-events: none;
+  background: #b71c1c; border: 2px solid #ef5350;
+  border-radius: 14px; padding: 12px 22px;
+  font-size: 13px; font-weight: 800; color: #fff;
+  white-space: nowrap; max-width: 90vw;
+  box-shadow: 0 8px 24px rgba(0,0,0,.4);
+}
+#toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* ════════════════════════ ANIMATIONS ════════════════════════ */
+@keyframes fadeIn { from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none} }
+</style>
+</head>
+<body>
+
+<!-- ══ SPLASH ══ -->
+<div id="splash">
+  <div class="splash-logo">🏥</div>
+  <div class="splash-name" id="splash-hosp">HMS Attendance</div>
+  <div class="splash-sub">Employee QR Scanner</div>
+  <div class="splash-bar-wrap"><div class="splash-bar"></div></div>
+  <div class="splash-version">v2.0 · PWA</div>
+</div>
+
+<!-- ══ INSTALL PROMPT ══ -->
+<div id="install-prompt">
+  <div class="install-card">
+    <div class="ic-icon">📲</div>
+    <h2>Install HMS Attendance App</h2>
+    <p>Add to your home screen for faster access — works offline, no browser needed.</p>
+    <div class="ic-features">
+      <span class="ic-feat">📷 Camera Ready</span>
+      <span class="ic-feat">⚡ Instant Scan</span>
+      <span class="ic-feat">📶 Works Offline</span>
+    </div>
+    <button class="install-btn" onclick="triggerInstall()">📲 Install Now — Free</button>
+    <button class="install-skip" onclick="dismissInstall()">Not now</button>
+  </div>
+</div>
+
+<!-- ══ SUCCESS OVERLAY ══ -->
+<div id="success-overlay">
+  <div class="success-icon" id="success-icon">✅</div>
+  <div class="success-title" id="success-title">Attendance Marked!</div>
+  <div class="success-name" id="success-name">Employee Name</div>
+  <div class="success-time" id="success-time">00:00:00</div>
+  <div class="success-bar-wrap"><div class="success-bar" id="success-bar"></div></div>
+</div>
+
+<!-- ══ TOAST ══ -->
+<div id="toast"></div>
+
+<!-- ══ APP ══ -->
+<div id="app">
+
+  <!-- Top Bar -->
+  <div class="topbar">
+    <div class="topbar-left">
+      <div class="topbar-logo">🏥</div>
+      <div>
+        <div class="topbar-title" id="tb-hosp">HMS</div>
+        <div class="topbar-sub">Attendance Scanner</div>
+      </div>
+    </div>
+    <div class="network-pill online" id="net-pill">
+      <div class="net-dot"></div>
+      <span id="net-label">Online</span>
+    </div>
+  </div>
+
+  <!-- ══ LOGIN SCREEN ══ -->
+  <div class="screen active" id="screen-login">
+    <div class="login-avatar">👤</div>
+    <div class="login-title">Employee Login</div>
+    <div class="login-sub">Enter your Employee ID to<br>access the attendance scanner</div>
+    <div class="login-form">
+      <input type="text" id="login-input" class="att-input"
+        placeholder="e.g. EMP-0001-26"
+        autocomplete="off" autocapitalize="characters" inputmode="text"
+        onkeydown="if(event.key==='Enter')doLogin()">
+      <button class="login-btn" onclick="doLogin()">🔓 Login</button>
+      <div class="login-err" id="login-err"></div>
+    </div>
+  </div>
+
+  <!-- ══ MAIN SCANNER SCREEN ══ -->
+  <div class="screen" id="screen-main">
+
+    <!-- Employee strip -->
+    <div class="emp-strip">
+      <div class="emp-avatar" id="emp-avatar">?</div>
+      <div>
+        <div class="emp-name" id="emp-name">Employee</div>
+        <div class="emp-desig" id="emp-desig">Department</div>
+        <div class="emp-id" id="emp-id">EMP-0000-00</div>
+      </div>
+    </div>
+
+    <!-- Attendance type -->
+    <div class="type-row">
+      <button class="type-btn sel-in" id="type-IN" onclick="setType('IN')">
+        <span class="ticon">🟢</span>IN
+      </button>
+      <button class="type-btn" id="type-OUT" onclick="setType('OUT')">
+        <span class="ticon">🔴</span>OUT
+      </button>
+      <button class="type-btn" id="type-BREAK" onclick="setType('BREAK')">
+        <span class="ticon">🟡</span>BREAK
+      </button>
+    </div>
+
+    <!-- Token status -->
+    <div class="token-bar">
+      <div class="token-pill token-wait" id="token-pill">
+        <span>🔐</span><span id="token-label">Checking token...</span>
+      </div>
+      <div style="font-size:11px;color:var(--muted);font-weight:600" id="token-time"></div>
+    </div>
+
+    <!-- Scanner -->
+    <div class="scanner-wrap">
+      <div id="qr-reader" style="display:none"></div>
+
+      <button class="scan-start-btn" id="scan-start-btn" onclick="startScan(this)" disabled>
+        <span style="font-size:22px">📷</span>
+        <span id="scan-btn-label">Scan QR Code</span>
+      </button>
+      <button class="stop-scan-btn" id="scan-stop-btn" style="display:none" onclick="stopScan()">
+        ✕ Cancel Scan
+      </button>
+      <div class="scan-hint" id="scan-hint">Point camera at the QR code on the monitor</div>
+    </div>
+
+    <!-- Bottom bar -->
+    <div class="bottom-bar">
+      <div class="today-badge">Today: <b id="today-count">0</b> scans</div>
+      <button class="logout-btn" onclick="doLogout()">↩ Logout</button>
+    </div>
+
+  </div><!-- /screen-main -->
+
+</div><!-- /app -->
+
+<script>
+'use strict';
+
+// ══════════════════════════════════════════════════
+//  CONFIG
+// ══════════════════════════════════════════════════
+const EMP_KEY   = 'hms_hr_employees';
+const ATT_KEY   = 'hms_attendance';
+const TOKEN_KEY = 'hms_att_token';
+const ATT_TTL   = 180; // seconds — must match HMS admin panel
+
+// ══════════════════════════════════════════════════
+//  STATE
+// ══════════════════════════════════════════════════
+let currentEmp      = null;
+let selectedType    = 'IN';
+let html5Scanner    = null;
+let scannerActive   = false;
+let networkOK       = false;
+let installPrompt   = null;
+let tokenCheckTimer = null;
+
+// ══════════════════════════════════════════════════
+//  PWA: Service Worker + Install
+// ══════════════════════════════════════════════════
+// SW registered via inline PWA bootstrap (see top of file)
+
+// Capture install prompt
+window.addEventListener('beforeinstallprompt', e => {
+  e.preventDefault();
+  installPrompt = e;
+  // Show after splash (2.5s)
+  const dismissed = sessionStorage.getItem('install-dismissed');
+  if (!dismissed) {
+    setTimeout(() => showInstallPrompt(), 2500);
+  }
+});
+
+function showInstallPrompt() {
+  document.getElementById('install-prompt').classList.add('show');
+}
+function dismissInstall() {
+  document.getElementById('install-prompt').classList.remove('show');
+  sessionStorage.setItem('install-dismissed', '1');
+}
+async function triggerInstall() {
+  if (!installPrompt) return;
+  installPrompt.prompt();
+  const result = await installPrompt.userChoice;
+  if (result.outcome === 'accepted') {
+    installPrompt = null;
+    dismissInstall();
+  }
+}
+
+// ══════════════════════════════════════════════════
+//  SPLASH
+// ══════════════════════════════════════════════════
+window.addEventListener('DOMContentLoaded', () => {
+  loadHospInfo();
+  startNetworkCheck();
+
+  // Dismiss splash after 2s
+  setTimeout(() => {
+    document.getElementById('splash').classList.add('hide');
+    setTimeout(() => {
+      document.getElementById('splash').style.display = 'none';
+    }, 700);
+  }, 2000);
+
+  // Check if session has saved employee
+  const savedId = sessionStorage.getItem('att_scanner_emp');
+  if (savedId) loginWithId(savedId);
+
+  // Start token checker
+  tokenCheckTimer = setInterval(checkToken, 3000);
+  checkToken();
+
+  updateTodayCount();
+});
+
+// ══════════════════════════════════════════════════
+//  HOSPITAL INFO
+// ══════════════════════════════════════════════════
+function loadHospInfo() {
+  try {
+    const st = JSON.parse(localStorage.getItem('hms_st') || '{}');
+    const name = st.hospName || 'HMS';
+    document.getElementById('splash-hosp').textContent = name + ' Attendance';
+    document.getElementById('tb-hosp').textContent = name;
+  } catch(e) {}
+}
+
+// ══════════════════════════════════════════════════
+//  NETWORK
+// ══════════════════════════════════════════════════
+function startNetworkCheck() {
+  updateNetworkUI();
+  window.addEventListener('online',  updateNetworkUI);
+  window.addEventListener('offline', updateNetworkUI);
+  setInterval(updateNetworkUI, 10000);
+}
+
+function updateNetworkUI() {
+  networkOK = navigator.onLine;
+  const pill  = document.getElementById('net-pill');
+  const label = document.getElementById('net-label');
+  if (networkOK) {
+    pill.className = 'network-pill online';
+    label.textContent = 'Online';
+  } else {
+    pill.className = 'network-pill offline';
+    label.textContent = 'Offline';
+  }
+  updateScanButton();
+}
+
+// ══════════════════════════════════════════════════
+//  TOKEN VALIDATION
+// ══════════════════════════════════════════════════
+function checkToken() {
+  const pill  = document.getElementById('token-pill');
+  const label = document.getElementById('token-label');
+  const ttime = document.getElementById('token-time');
+  if (!pill) return;
+
+  try {
+    const stored = JSON.parse(localStorage.getItem(TOKEN_KEY) || 'null');
+    if (!stored) {
+      pill.className = 'token-pill token-wait';
+      label.textContent = 'Waiting for HMS QR...';
+      ttime.textContent = '';
+      updateScanButton(false);
+      return;
+    }
+    const remaining = Math.max(0, Math.floor((stored.expiry - Date.now()) / 1000));
+    if (remaining <= 0) {
+      pill.className = 'token-pill token-invalid';
+      label.textContent = 'Token expired — awaiting refresh';
+      ttime.textContent = 'Will refresh automatically';
+      updateScanButton(false);
+    } else {
+      const mm = Math.floor(remaining / 60);
+      const ss = String(remaining % 60).padStart(2, '0');
+      pill.className = 'token-pill token-valid';
+      label.textContent = '🔐 Token valid';
+      ttime.textContent = `Expires in ${mm}:${ss}`;
+      updateScanButton(true);
+    }
+  } catch(e) {
+    pill.className = 'token-pill token-wait';
+    label.textContent = 'Token check error';
+    updateScanButton(false);
+  }
+}
+
+function getValidToken() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(TOKEN_KEY) || 'null');
+    if (!stored) return null;
+    if (Date.now() > stored.expiry) return null;
+    return stored.token;
+  } catch { return null; }
+}
+
+function updateScanButton(tokenOK) {
+  const btn = document.getElementById('scan-start-btn');
+  if (!btn || scannerActive) return;
+  const ok = currentEmp && (tokenOK !== false ? getValidToken() !== null : false);
+  btn.disabled = !ok;
+  document.getElementById('scan-btn-label').textContent = ok
+    ? 'Scan QR Code' : (currentEmp ? 'Awaiting valid QR token' : 'Login first');
+}
+
+// ══════════════════════════════════════════════════
+//  LOGIN
+// ══════════════════════════════════════════════════
+function doLogin() {
+  const val = (document.getElementById('login-input')?.value || '').trim().toUpperCase();
+  const err = document.getElementById('login-err');
+  if (!val) { if(err) err.textContent = 'Please enter your Employee ID.'; return; }
+  loginWithId(val);
+}
+
+function loginWithId(empId) {
+  const employees = JSON.parse(localStorage.getItem(EMP_KEY) || '[]');
+  const emp = employees.find(e =>
+    e.empId?.toUpperCase() === empId.toUpperCase() ||
+    e.id?.toUpperCase()    === empId.toUpperCase()
+  );
+  const err = document.getElementById('login-err');
+  if (!emp) {
+    if (err) err.textContent = 'Employee ID not found.';
+    sessionStorage.removeItem('att_scanner_emp');
+    return;
+  }
+  if (emp.status === 'Inactive') {
+    if (err) err.textContent = 'This account is inactive — contact HR.';
+    return;
+  }
+  currentEmp = emp;
+  sessionStorage.setItem('att_scanner_emp', emp.empId || emp.id);
+
+  // Update UI
+  const av = document.getElementById('emp-avatar');
+  if (emp.photo) {
+    av.innerHTML = `<img src="${emp.photo}">`;
+  } else {
+    const ini = emp.name ? emp.name.split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase() : '?';
+    av.textContent = ini;
+  }
+  document.getElementById('emp-name').textContent  = emp.name  || 'Employee';
+  document.getElementById('emp-desig').textContent = (emp.designation || '—') + ' · ' + (emp.dept || '—');
+  document.getElementById('emp-id').textContent    = emp.empId || emp.id;
+
+  showScreen('main');
+  checkToken();
+  updateTodayCount();
+  if (err) err.textContent = '';
+  document.getElementById('login-input').value = '';
+}
+
+function doLogout() {
+  stopScan();
+  currentEmp = null;
+  sessionStorage.removeItem('att_scanner_emp');
+  showScreen('login');
+}
+
+// ══════════════════════════════════════════════════
+//  SCREEN SWITCH
+// ══════════════════════════════════════════════════
+function showScreen(name) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById('screen-' + name)?.classList.add('active');
+}
+
+// ══════════════════════════════════════════════════
+//  ATTENDANCE TYPE
+// ══════════════════════════════════════════════════
+function setType(type) {
+  selectedType = type;
+  ['IN','OUT','BREAK'].forEach(t => {
+    const btn = document.getElementById('type-'+t);
+    if (!btn) return;
+    btn.className = 'type-btn' + (t===type ? ` sel-${t.toLowerCase()}` : '');
+  });
+}
+
+// ══════════════════════════════════════════════════
+//  QR SCANNER
+// ══════════════════════════════════════════════════
+function startScan(btnEl) {
+  if (scannerActive) return;
+  if (!currentEmp) { showToast('Login first'); return; }
+  const token = getValidToken();
+  if (!token) { showToast('QR token expired — wait for admin to refresh'); return; }
+
+  const qrEl     = document.getElementById('qr-reader');
+  const startBtn = document.getElementById('scan-start-btn');
+  const stopBtn  = document.getElementById('scan-stop-btn');
+  const hint     = document.getElementById('scan-hint');
+
+  qrEl.style.display   = 'block';
+  startBtn.style.display= 'none';
+  stopBtn.style.display = 'block';
+  if (hint) hint.textContent = 'Align QR code within the frame';
+
+  html5Scanner  = new Html5Qrcode('qr-reader');
+  scannerActive = true;
+
+  const config = { fps: 15, qrbox: { width: 230, height: 230 }, aspectRatio: 1.0 };
+
+  const onSuccess = (decoded) => onQRDecoded(decoded);
+  const onFail    = () => {};
+
+  // Try rear camera first (better for QR scanning)
+  html5Scanner.start({ facingMode: 'environment' }, config, onSuccess, onFail)
+    .catch(() => {
+      // Fallback to any available camera
+      Html5Qrcode.getCameras()
+        .then(cameras => {
+          if (!cameras.length) throw new Error('No camera');
+          return html5Scanner.start(cameras[0].id, config, onSuccess, onFail);
+        })
+        .catch(err => {
+          stopScan();
+          showToast('Camera access denied — please allow camera permission');
+        });
+    });
+}
+
+function stopScan() {
+  if (html5Scanner && scannerActive) {
+    html5Scanner.stop().catch(() => {}).finally(() => {
+      html5Scanner.clear();
+      html5Scanner = null;
+    });
+  }
+  scannerActive = false;
+
+  const qrEl     = document.getElementById('qr-reader');
+  const startBtn = document.getElementById('scan-start-btn');
+  const stopBtn  = document.getElementById('scan-stop-btn');
+  const hint     = document.getElementById('scan-hint');
+
+  if (qrEl)     qrEl.style.display    = 'none';
+  if (startBtn) startBtn.style.display = 'flex';
+  if (stopBtn)  stopBtn.style.display  = 'none';
+  if (hint)     hint.textContent = 'Point camera at the QR code on the monitor';
+
+  checkToken(); // re-evaluate button state
+}
+
+// ══════════════════════════════════════════════════
+//  QR DECODED → VALIDATE → LOG
+// ══════════════════════════════════════════════════
+function onQRDecoded(decodedText) {
+  stopScan();
+
+  // Parse QR payload
+  let payload = null;
+  try { payload = JSON.parse(decodedText); } catch(e) {}
+
+  // Validate type
+  if (!payload || payload.type !== 'HMS_ATTENDANCE') {
+    showToast('❌ Invalid QR — not an HMS attendance code');
+    return;
+  }
+
+  // Validate token against stored token
+  const stored = JSON.parse(localStorage.getItem(TOKEN_KEY) || 'null');
+  if (!stored) {
+    showToast('⏳ No active token — wait for admin to open Monitor QR');
+    return;
+  }
+  if (Date.now() > stored.expiry) {
+    showToast('⏰ Token expired — admin must refresh QR');
+    return;
+  }
+  if (payload.token !== stored.token) {
+    showToast('🔐 Invalid token — use the current QR from the monitor');
+    return;
+  }
+
+  // ✅ Valid — log attendance
+  const now     = new Date();
+  const timeStr = now.toTimeString().slice(0, 8);
+  const dateStr = now.toISOString().split('T')[0];
+
+  const entry = {
+    id:          'ATT_' + Date.now(),
+    empId:       currentEmp.empId || currentEmp.id,
+    empName:     currentEmp.name,
+    designation: currentEmp.designation || '',
+    dept:        currentEmp.dept || '',
+    type:        selectedType,
+    date:        dateStr,
+    time:        timeStr,
+    onWifi:      networkOK,
+    tokenUsed:   stored.token.slice(0, 16),
+    deviceInfo:  navigator.userAgent.slice(0, 60),
+    createdAt:   now.toISOString()
+  };
+
+  const logs = JSON.parse(localStorage.getItem(ATT_KEY) || '[]');
+  logs.push(entry);
+  localStorage.setItem(ATT_KEY, JSON.stringify(logs));
+
+  // Vibrate on success (mobile haptic)
+  if (navigator.vibrate) navigator.vibrate([100, 50, 100]);
+
+  showSuccess(entry);
+  updateTodayCount();
+}
+
+// ══════════════════════════════════════════════════
+//  SUCCESS OVERLAY
+// ══════════════════════════════════════════════════
+function showSuccess(entry) {
+  const icons  = { IN: '✅', OUT: '🔴', BREAK: '🟡' };
+  const titles = { IN: 'Checked IN!', OUT: 'Checked OUT!', BREAK: 'Break Marked!' };
+
+  document.getElementById('success-icon').textContent  = icons[entry.type]  || '✅';
+  document.getElementById('success-title').textContent = titles[entry.type] || 'Recorded!';
+  document.getElementById('success-name').textContent  = entry.empName;
+  document.getElementById('success-time').textContent  = entry.type + ' · ' + entry.time;
+
+  const overlay = document.getElementById('success-overlay');
+  const bar     = document.getElementById('success-bar');
+
+  overlay.classList.add('show');
+  bar.style.width = '0%';
+  setTimeout(() => { bar.style.width = '100%'; }, 50);
+
+  // Auto-dismiss after 4s
+  setTimeout(() => {
+    overlay.classList.remove('show');
+    setType('IN'); // reset type
+  }, 4000);
+}
+
+// ══════════════════════════════════════════════════
+//  TODAY COUNT
+// ══════════════════════════════════════════════════
+function updateTodayCount() {
+  const today = new Date().toISOString().split('T')[0];
+  const logs  = JSON.parse(localStorage.getItem(ATT_KEY) || '[]');
+  const n     = logs.filter(a => a.date === today && a.empId === (currentEmp?.empId || currentEmp?.id)).length;
+  const el    = document.getElementById('today-count');
+  if (el) el.textContent = n;
+}
+
+// ══════════════════════════════════════════════════
+//  TOAST
+// ══════════════════════════════════════════════════
+let toastTimer = null;
+function showToast(msg, duration = 3500) {
+  if (toastTimer) clearTimeout(toastTimer);
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  toastTimer = setTimeout(() => el.classList.remove('show'), duration);
+}
+
+// ══════════════════════════════════════════════════
+//  SECURITY
+// ══════════════════════════════════════════════════
+// Prevent back navigation (kiosk-like)
+history.pushState(null, '', location.href);
+window.addEventListener('popstate', () => {
+  history.pushState(null, '', location.href);
+});
+
+// Disable right-click and dev shortcuts
+document.addEventListener('contextmenu', e => e.preventDefault());
+document.addEventListener('keydown', e => {
+  if (e.key === 'F12' || (e.ctrlKey && ['u','s','p'].includes(e.key.toLowerCase()))) {
+    e.preventDefault();
+  }
+});
+</script>
+</body>
+</html>
